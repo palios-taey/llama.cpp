@@ -993,7 +993,9 @@ static void llama_grammar_scan_token_to_column(
               size_t                              source,
               size_t                              target,
               llama_token                         token) {
-    for (const llama_grammar_item & item : chart[source].items) {
+    const size_t n_items = chart[source].items.size();
+    for (size_t i = 0; i < n_items; ++i) {
+        const llama_grammar_item item = chart[source].items[i];
         const llama_grammar_element * pos = &rules[item.rule][item.dot];
 
         if (llama_grammar_is_token_element(pos) && llama_grammar_match_token(pos, token)) {
@@ -1488,15 +1490,13 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
         llama_grammar_scan_chr(grammar.rules, grammar.rules_may_be_empty, grammar.chart, *it);
     }
 
-    if (!code_points.empty() && code_points.front() != 0) {
-        llama_grammar_scan_token_to_column(
-                grammar.rules,
-                grammar.rules_may_be_empty,
-                grammar.chart,
-                source,
-                grammar.chart.size() - 1,
-                token);
-    }
+    llama_grammar_scan_token_to_column(
+            grammar.rules,
+            grammar.rules_may_be_empty,
+            grammar.chart,
+            source,
+            grammar.chart.size() - 1,
+            token);
 
     grammar.partial_utf8 = decoded.second;
     llama_grammar_sync_stacks(grammar);
