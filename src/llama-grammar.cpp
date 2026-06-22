@@ -1121,53 +1121,6 @@ struct llama_grammar_trial_chart {
     }
 };
 
-struct llama_grammar_transition_entry {
-    uint32_t chr;
-    std::vector<llama_grammar_item> source;
-    std::vector<llama_grammar_item> target;
-};
-
-using llama_grammar_transition_cache = std::unordered_map<size_t, std::vector<llama_grammar_transition_entry>>;
-
-static size_t llama_grammar_transition_hash(
-        uint32_t chr,
-        const std::vector<llama_grammar_item> & items) {
-    size_t h = chr;
-    for (const llama_grammar_item & item : items) {
-        h = h * 16777619u ^ item.rule;
-        h = h * 16777619u ^ item.dot;
-        h = h * 16777619u ^ item.origin;
-    }
-    return h;
-}
-
-static const std::vector<llama_grammar_item> * llama_grammar_find_transition(
-        const llama_grammar_transition_cache & cache,
-        uint32_t chr,
-        const std::vector<llama_grammar_item> & source) {
-    const auto bucket = cache.find(llama_grammar_transition_hash(chr, source));
-    if (bucket == cache.end()) {
-        return nullptr;
-    }
-
-    for (const llama_grammar_transition_entry & entry : bucket->second) {
-        if (entry.chr == chr && entry.source == source) {
-            return &entry.target;
-        }
-    }
-
-    return nullptr;
-}
-
-static void llama_grammar_store_transition(
-        llama_grammar_transition_cache & cache,
-        uint32_t chr,
-        const std::vector<llama_grammar_item> & source,
-        const std::vector<llama_grammar_item> & target) {
-    const size_t hash = llama_grammar_transition_hash(chr, source);
-    cache[hash].push_back({ chr, source, target });
-}
-
 static void llama_grammar_close_trial_column(
         const llama_grammar_rules   & rules,
         const std::vector<bool>     & rules_may_be_empty,
@@ -1222,23 +1175,12 @@ static size_t llama_grammar_trial_scan_chr(
         const std::vector<bool>     & rules_may_be_empty,
               llama_grammar_trial_chart & chart,
               size_t                 source,
-              uint32_t               chr,
-              llama_grammar_transition_cache & cache) {
-    const std::vector<llama_grammar_item> & source_items = chart.items(source);
-    const std::vector<llama_grammar_item> * cached = llama_grammar_find_transition(cache, chr, source_items);
-    std::vector<llama_grammar_item> source_copy;
-    if (cached == nullptr) {
-        source_copy = source_items;
-    }
+              uint32_t               chr) {
+    const std::vector<llama_grammar_item> source_items = chart.items(source);
     const size_t target = chart.add_column();
     std::vector<llama_grammar_item> & target_items = chart.mutable_added_items(target);
 
-    if (cached != nullptr) {
-        target_items = *cached;
-        return target;
-    }
-
-    for (const llama_grammar_item & item : source_copy) {
+    for (const llama_grammar_item & item : source_items) {
         const llama_grammar_element * pos = &rules[item.rule][item.dot];
 
         if (!llama_grammar_is_char_element_start(pos)) {
@@ -1252,15 +1194,13 @@ static size_t llama_grammar_trial_scan_chr(
     }
 
     llama_grammar_close_trial_column(rules, rules_may_be_empty, chart, target);
-    llama_grammar_store_transition(cache, chr, source_copy, target_items);
     return target;
 }
 
 static bool llama_grammar_accepts_candidate(
         const llama_grammar           & grammar,
         const llama_grammar_candidate & candidate,
-        llama_grammar_trial_chart     & chart,
-        llama_grammar_transition_cache & cache) {
+        llama_grammar_trial_chart     & chart) {
     bool accepts_token_terminal = false;
 
     if (*candidate.code_points != 0) {
@@ -1288,7 +1228,7 @@ static bool llama_grammar_accepts_candidate(
     chart.reset();
     size_t column = grammar.chart.size() - 1;
     for (const uint32_t * code_point = candidate.code_points; *code_point != 0; ++code_point) {
-        column = llama_grammar_trial_scan_chr(grammar.rules, grammar.rules_may_be_empty, chart, column, *code_point, cache);
+        column = llama_grammar_trial_scan_chr(grammar.rules, grammar.rules_may_be_empty, chart, column, *code_point);
     }
 
     if (candidate.partial_utf8.n_remain != 0) {
@@ -1306,7 +1246,6 @@ static llama_grammar_candidates llama_grammar_reject_candidates(
     llama_grammar_candidates rejects;
     rejects.reserve(candidates.size());
     llama_grammar_trial_chart chart{ grammar.chart, {} };
-    llama_grammar_transition_cache cache;
 
     if (grammar.candidate_cache_revision != grammar.revision) {
         grammar.candidate_accept_cache.clear();
@@ -1316,7 +1255,7 @@ static llama_grammar_candidates llama_grammar_reject_candidates(
     for (const llama_grammar_candidate & candidate : candidates) {
         const auto cached = grammar.candidate_accept_cache.find(candidate.id);
         const bool accepts = cached == grammar.candidate_accept_cache.end() ?
-            llama_grammar_accepts_candidate(grammar, candidate, chart, cache) :
+            llama_grammar_accepts_candidate(grammar, candidate, chart) :
             cached->second;
 
         if (cached == grammar.candidate_accept_cache.end()) {
