@@ -5,6 +5,7 @@
 #include <map>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -156,6 +157,10 @@ struct llama_grammar {
     // Opaque compatibility snapshot for tests and legacy callers that only need
     // emptiness/completion/next-terminal visibility. The chart is authoritative.
     llama_grammar_stacks stacks;
+
+    uint64_t revision = 0;
+    mutable uint64_t candidate_cache_revision = UINT64_MAX;
+    mutable std::unordered_map<llama_token, bool> candidate_accept_cache;
 
     // buffer for partially generated UTF-8 sequence from accepted tokens
     llama_partial_utf8 partial_utf8;

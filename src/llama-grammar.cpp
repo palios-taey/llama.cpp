@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <unordered_map>
 
 #define MAX_REPETITION_THRESHOLD 2000
 //
@@ -914,6 +915,63 @@ static void llama_grammar_add_rule_alternates(
     }
 }
 
+static void llama_grammar_add_rule_alternates(
+        const llama_grammar_rules  & rules,
+              llama_grammar_chart_column & column,
+              uint32_t              rule_id,
+              uint32_t              origin) {
+    const llama_grammar_rule & rule = rules[rule_id];
+    uint32_t dot = 0;
+
+    while (true) {
+        llama_grammar_add_item(column, { rule_id, dot, origin });
+
+        while (!llama_grammar_is_end_of_sequence(&rule[dot])) {
+            ++dot;
+        }
+
+        if (rule[dot].type != LLAMA_GRETYPE_ALT) {
+            break;
+        }
+
+        ++dot;
+    }
+}
+
+static bool llama_grammar_add_trial_item(
+        std::vector<llama_grammar_item> & items,
+        const llama_grammar_item        & item) {
+    if (std::find(items.begin(), items.end(), item) != items.end()) {
+        return false;
+    }
+
+    items.push_back(item);
+    return true;
+}
+
+static void llama_grammar_add_trial_rule_alternates(
+        const llama_grammar_rules        & rules,
+              std::vector<llama_grammar_item> & items,
+              uint32_t                    rule_id,
+              uint32_t                    origin) {
+    const llama_grammar_rule & rule = rules[rule_id];
+    uint32_t dot = 0;
+
+    while (true) {
+        llama_grammar_add_trial_item(items, { rule_id, dot, origin });
+
+        while (!llama_grammar_is_end_of_sequence(&rule[dot])) {
+            ++dot;
+        }
+
+        if (rule[dot].type != LLAMA_GRETYPE_ALT) {
+            break;
+        }
+
+        ++dot;
+    }
+}
+
 static void llama_grammar_close_column(
         const llama_grammar_rules               & rules,
         const std::vector<bool>                 & rules_may_be_empty,
@@ -1008,9 +1066,9 @@ static void llama_grammar_scan_token_to_column(
 
 static bool llama_grammar_has_partial_char_match(
         const llama_grammar_rules        & rules,
-        const llama_grammar_chart_column & column,
+        const std::vector<llama_grammar_item> & items,
         llama_partial_utf8                 partial_utf8) {
-    for (const llama_grammar_item & item : column.items) {
+    for (const llama_grammar_item & item : items) {
         const llama_grammar_element * pos = &rules[item.rule][item.dot];
 
         if (llama_grammar_is_char_element_start(pos) && llama_grammar_match_partial_char(pos, partial_utf8)) {
@@ -1021,9 +1079,188 @@ static bool llama_grammar_has_partial_char_match(
     return false;
 }
 
+static bool llama_grammar_has_partial_char_match(
+        const llama_grammar_rules        & rules,
+        const llama_grammar_chart_column & column,
+        llama_partial_utf8                 partial_utf8) {
+    return llama_grammar_has_partial_char_match(rules, column.items, partial_utf8);
+}
+
+struct llama_grammar_trial_chart {
+    const std::vector<llama_grammar_chart_column> & base;
+    std::vector<std::vector<llama_grammar_item>> added;
+    size_t n_added = 0;
+
+    void reset() {
+        for (size_t i = 0; i < n_added; ++i) {
+            added[i].clear();
+        }
+        n_added = 0;
+    }
+
+    size_t add_column() {
+        if (n_added == added.size()) {
+            added.emplace_back();
+        } else {
+            added[n_added].clear();
+        }
+        return base.size() + n_added++;
+    }
+
+    const std::vector<llama_grammar_item> & items(size_t index) const {
+        if (index < base.size()) {
+            return base[index].items;
+        }
+        return added[index - base.size()];
+    }
+
+    std::vector<llama_grammar_item> & mutable_added_items(size_t index) {
+        GGML_ASSERT(index >= base.size());
+        GGML_ASSERT(index - base.size() < n_added);
+        return added[index - base.size()];
+    }
+};
+
+struct llama_grammar_transition_entry {
+    uint32_t chr;
+    std::vector<llama_grammar_item> source;
+    std::vector<llama_grammar_item> target;
+};
+
+using llama_grammar_transition_cache = std::unordered_map<size_t, std::vector<llama_grammar_transition_entry>>;
+
+static size_t llama_grammar_transition_hash(
+        uint32_t chr,
+        const std::vector<llama_grammar_item> & items) {
+    size_t h = chr;
+    for (const llama_grammar_item & item : items) {
+        h = h * 16777619u ^ item.rule;
+        h = h * 16777619u ^ item.dot;
+        h = h * 16777619u ^ item.origin;
+    }
+    return h;
+}
+
+static const std::vector<llama_grammar_item> * llama_grammar_find_transition(
+        const llama_grammar_transition_cache & cache,
+        uint32_t chr,
+        const std::vector<llama_grammar_item> & source) {
+    const auto bucket = cache.find(llama_grammar_transition_hash(chr, source));
+    if (bucket == cache.end()) {
+        return nullptr;
+    }
+
+    for (const llama_grammar_transition_entry & entry : bucket->second) {
+        if (entry.chr == chr && entry.source == source) {
+            return &entry.target;
+        }
+    }
+
+    return nullptr;
+}
+
+static void llama_grammar_store_transition(
+        llama_grammar_transition_cache & cache,
+        uint32_t chr,
+        const std::vector<llama_grammar_item> & source,
+        const std::vector<llama_grammar_item> & target) {
+    const size_t hash = llama_grammar_transition_hash(chr, source);
+    cache[hash].push_back({ chr, source, target });
+}
+
+static void llama_grammar_close_trial_column(
+        const llama_grammar_rules   & rules,
+        const std::vector<bool>     & rules_may_be_empty,
+              llama_grammar_trial_chart & chart,
+              size_t                 column) {
+    std::vector<llama_grammar_item> & current = chart.mutable_added_items(column);
+
+    for (size_t i = 0; i < current.size(); ++i) {
+        const llama_grammar_item item = current[i];
+        const llama_grammar_element * pos = &rules[item.rule][item.dot];
+
+        if (llama_grammar_is_end_of_sequence(pos)) {
+            const std::vector<llama_grammar_item> & origin = chart.items(item.origin);
+
+            for (size_t j = 0; j < origin.size(); ++j) {
+                const llama_grammar_item caller = origin[j];
+                const llama_grammar_element * caller_pos = &rules[caller.rule][caller.dot];
+
+                if (caller_pos->type == LLAMA_GRETYPE_RULE_REF && caller_pos->value == item.rule) {
+                    llama_grammar_add_trial_item(current, llama_grammar_advance_item(rules, caller, caller_pos + 1));
+                }
+            }
+
+            continue;
+        }
+
+        if (pos->type != LLAMA_GRETYPE_RULE_REF) {
+            continue;
+        }
+
+        const uint32_t rule_id = pos->value;
+        llama_grammar_add_trial_rule_alternates(rules, current, rule_id, static_cast<uint32_t>(column));
+
+        if (rules_may_be_empty[rule_id]) {
+            llama_grammar_add_trial_item(current, llama_grammar_advance_item(rules, item, pos + 1));
+        }
+
+        for (size_t j = 0; j < current.size(); ++j) {
+            const llama_grammar_item completed = current[j];
+
+            if (completed.rule == rule_id &&
+                    completed.origin == column &&
+                    llama_grammar_item_is_complete(rules, completed)) {
+                llama_grammar_add_trial_item(current, llama_grammar_advance_item(rules, item, pos + 1));
+            }
+        }
+    }
+}
+
+static size_t llama_grammar_trial_scan_chr(
+        const llama_grammar_rules   & rules,
+        const std::vector<bool>     & rules_may_be_empty,
+              llama_grammar_trial_chart & chart,
+              size_t                 source,
+              uint32_t               chr,
+              llama_grammar_transition_cache & cache) {
+    const std::vector<llama_grammar_item> & source_items = chart.items(source);
+    const std::vector<llama_grammar_item> * cached = llama_grammar_find_transition(cache, chr, source_items);
+    std::vector<llama_grammar_item> source_copy;
+    if (cached == nullptr) {
+        source_copy = source_items;
+    }
+    const size_t target = chart.add_column();
+    std::vector<llama_grammar_item> & target_items = chart.mutable_added_items(target);
+
+    if (cached != nullptr) {
+        target_items = *cached;
+        return target;
+    }
+
+    for (const llama_grammar_item & item : source_copy) {
+        const llama_grammar_element * pos = &rules[item.rule][item.dot];
+
+        if (!llama_grammar_is_char_element_start(pos)) {
+            continue;
+        }
+
+        const auto match = llama_grammar_match_char(pos, chr);
+        if (match.first) {
+            llama_grammar_add_trial_item(target_items, llama_grammar_advance_item(rules, item, match.second));
+        }
+    }
+
+    llama_grammar_close_trial_column(rules, rules_may_be_empty, chart, target);
+    llama_grammar_store_transition(cache, chr, source_copy, target_items);
+    return target;
+}
+
 static bool llama_grammar_accepts_candidate(
         const llama_grammar           & grammar,
-        const llama_grammar_candidate & candidate) {
+        const llama_grammar_candidate & candidate,
+        llama_grammar_trial_chart     & chart,
+        llama_grammar_transition_cache & cache) {
     bool accepts_token_terminal = false;
 
     if (*candidate.code_points != 0) {
@@ -1048,18 +1285,19 @@ static bool llama_grammar_accepts_candidate(
         }
     }
 
-    auto chart = grammar.chart;
+    chart.reset();
+    size_t column = grammar.chart.size() - 1;
     for (const uint32_t * code_point = candidate.code_points; *code_point != 0; ++code_point) {
-        llama_grammar_scan_chr(grammar.rules, grammar.rules_may_be_empty, chart, *code_point);
+        column = llama_grammar_trial_scan_chr(grammar.rules, grammar.rules_may_be_empty, chart, column, *code_point, cache);
     }
 
     if (candidate.partial_utf8.n_remain != 0) {
         return accepts_token_terminal ||
-            (!chart.back().items.empty() &&
-             llama_grammar_has_partial_char_match(grammar.rules, chart.back(), candidate.partial_utf8));
+            (!chart.items(column).empty() &&
+             llama_grammar_has_partial_char_match(grammar.rules, chart.items(column), candidate.partial_utf8));
     }
 
-    return accepts_token_terminal || !chart.back().items.empty();
+    return accepts_token_terminal || !chart.items(column).empty();
 }
 
 static llama_grammar_candidates llama_grammar_reject_candidates(
@@ -1067,9 +1305,25 @@ static llama_grammar_candidates llama_grammar_reject_candidates(
         const llama_grammar_candidates & candidates) {
     llama_grammar_candidates rejects;
     rejects.reserve(candidates.size());
+    llama_grammar_trial_chart chart{ grammar.chart, {} };
+    llama_grammar_transition_cache cache;
+
+    if (grammar.candidate_cache_revision != grammar.revision) {
+        grammar.candidate_accept_cache.clear();
+        grammar.candidate_cache_revision = grammar.revision;
+    }
 
     for (const llama_grammar_candidate & candidate : candidates) {
-        if (!llama_grammar_accepts_candidate(grammar, candidate)) {
+        const auto cached = grammar.candidate_accept_cache.find(candidate.id);
+        const bool accepts = cached == grammar.candidate_accept_cache.end() ?
+            llama_grammar_accepts_candidate(grammar, candidate, chart, cache) :
+            cached->second;
+
+        if (cached == grammar.candidate_accept_cache.end()) {
+            grammar.candidate_accept_cache.emplace(candidate.id, accepts);
+        }
+
+        if (!accepts) {
             rejects.push_back(candidate);
         }
     }
@@ -1178,6 +1432,12 @@ static void llama_grammar_sync_stacks(struct llama_grammar & grammar) {
     }
 }
 
+static void llama_grammar_invalidate_candidate_cache(struct llama_grammar & grammar) {
+    ++grammar.revision;
+    grammar.candidate_accept_cache.clear();
+    grammar.candidate_cache_revision = UINT64_MAX;
+}
+
 llama_grammar_stacks & llama_grammar_get_stacks(struct llama_grammar * grammar) {
     llama_grammar_sync_stacks(*grammar);
     return grammar->stacks;
@@ -1186,6 +1446,7 @@ llama_grammar_stacks & llama_grammar_get_stacks(struct llama_grammar * grammar) 
 void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr) {
     llama_grammar_scan_chr(grammar->rules, grammar->rules_may_be_empty, grammar->chart, chr);
     llama_grammar_sync_stacks(*grammar);
+    llama_grammar_invalidate_candidate_cache(*grammar);
 }
 
 static std::vector<llama_grammar_chart_column> llama_grammar_init_chart(
@@ -1240,6 +1501,9 @@ struct llama_grammar * llama_grammar_init_impl(
         std::move(rules_may_be_empty),
         std::move(chart),
         /* .stacks = */                   {},
+        /* .revision = */                 0,
+        /* .candidate_cache_revision = */ UINT64_MAX,
+        /* .candidate_accept_cache = */   {},
         /* .partial_utf8 = */             {},
         /* .lazy = */                     false,
         /* .awaiting_trigger = */         false,
@@ -1328,6 +1592,9 @@ struct llama_grammar * llama_grammar_init_impl(
         std::move(rules_may_be_empty),
         std::move(chart),
         /* .stacks = */                   {},
+        /* .revision = */                 0,
+        /* .candidate_cache_revision = */ UINT64_MAX,
+        /* .candidate_accept_cache = */   {},
         /* .partial_utf8 = */             {},
         /* .lazy = */                     lazy,
         /* .awaiting_trigger = */         lazy,
@@ -1356,6 +1623,9 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
         grammar.rules_may_be_empty,
         grammar.chart,
         grammar.stacks,
+        grammar.revision,
+        UINT64_MAX,
+        {},
         grammar.partial_utf8,
         grammar.lazy,
         grammar.awaiting_trigger,
@@ -1473,6 +1743,7 @@ void llama_grammar_accept_str(struct llama_grammar & grammar, const std::string 
 
     grammar.partial_utf8 = decoded.second;
     llama_grammar_sync_stacks(grammar);
+    llama_grammar_invalidate_candidate_cache(grammar);
 
     if (grammar.chart.back().items.empty()) {
         throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece);
@@ -1500,6 +1771,7 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
 
     grammar.partial_utf8 = decoded.second;
     llama_grammar_sync_stacks(grammar);
+    llama_grammar_invalidate_candidate_cache(grammar);
 
     if (grammar.chart.back().items.empty()) {
         throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece + " (" + std::to_string(token) + ")");
