@@ -77,6 +77,11 @@ static bool grammar_is_complete(const Grammar * grammar) {
     }
 }
 
+template <typename Grammar>
+static bool grammar_allows_eog(const Grammar * grammar) {
+    return grammar->partial_utf8.n_remain == 0 && grammar_is_complete(grammar);
+}
+
 static bool accept_token_piece(llama_grammar * grammar, const token_piece & piece, bool * complete) {
     try {
         llama_grammar_accept_token(*grammar, piece.token, piece.piece);
@@ -124,6 +129,59 @@ static std::vector<token_piece> repeat_piece(size_t n, llama_token token, const 
         result.push_back({ token, piece });
     }
     return result;
+}
+
+static void run_nullable_utf8_eog_regression(uint64_t * hash, size_t * decisions, bool trace) {
+    hash_string(hash, "nullable-utf8-eog-after-partial");
+    llama_grammar * grammar = build_grammar(R"""(root ::= "\u00E9" | "")""");
+
+    bool complete = false;
+    const bool c3_accept = accept_token_piece(grammar, {100, std::string("\xC3", 1)}, &complete);
+    const bool partial_eog = c3_accept && grammar_allows_eog(grammar);
+    assert(c3_accept);
+    assert(!partial_eog);
+    hash_bool(hash, c3_accept);
+    hash_bool(hash, partial_eog);
+    ++*decisions;
+    if (trace) {
+        std::printf("trace case=nullable-utf8-eog-after-partial step=0 token=100 piece_hex=c3 accept=%d eog_allowed=%d\n",
+                c3_accept ? 1 : 0,
+                partial_eog ? 1 : 0);
+    }
+
+    llama_grammar * completes_e9 = llama_grammar_clone_impl(*grammar);
+    bool e9_complete = false;
+    const bool a9_accept = accept_token_piece(completes_e9, {101, std::string("\xA9", 1)}, &e9_complete);
+    const bool e9_eog = a9_accept && grammar_allows_eog(completes_e9);
+    assert(a9_accept);
+    assert(e9_eog);
+    hash_bool(hash, a9_accept);
+    hash_bool(hash, e9_eog);
+    ++*decisions;
+    if (trace) {
+        std::printf("trace case=nullable-utf8-eog-complete step=1 token=101 piece_hex=a9 accept=%d eog_allowed=%d\n",
+                a9_accept ? 1 : 0,
+                e9_eog ? 1 : 0);
+    }
+
+    llama_grammar * completes_a0 = llama_grammar_clone_impl(*grammar);
+    bool a0_complete = false;
+    const bool a0_accept = accept_token_piece(completes_a0, {102, std::string("\xA0", 1)}, &a0_complete);
+    const bool a0_eog = a0_accept && grammar_allows_eog(completes_a0);
+    assert(!a0_accept);
+    assert(!a0_eog);
+    hash_bool(hash, a0_accept);
+    hash_bool(hash, a0_eog);
+    ++*decisions;
+    if (trace) {
+        std::printf("trace case=nullable-utf8-eog-wrong-codepoint step=1 token=102 piece_hex=a0 accept=%d eog_allowed=%d\n",
+                a0_accept ? 1 : 0,
+                a0_eog ? 1 : 0);
+    }
+
+    llama_grammar_free_impl(completes_a0);
+    llama_grammar_free_impl(completes_e9);
+    llama_grammar_free_impl(grammar);
 }
 
 static std::vector<corpus_case> build_corpus() {
@@ -194,6 +252,8 @@ int main(int argc, char ** argv) {
     const bool trace = argc > 1 && std::string(argv[1]) == "--trace";
     uint64_t hash = 1469598103934665603ull;
     size_t decisions = 0;
+
+    run_nullable_utf8_eog_regression(&hash, &decisions, trace);
 
     for (const corpus_case & test_case : build_corpus()) {
         llama_grammar * grammar = build_grammar(test_case.grammar);

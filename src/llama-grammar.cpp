@@ -1772,6 +1772,10 @@ static bool llama_grammar_is_complete(const struct llama_grammar & grammar) {
     return false;
 }
 
+static bool llama_grammar_allows_eog(const struct llama_grammar & grammar) {
+    return grammar.partial_utf8.n_remain == 0 && llama_grammar_is_complete(grammar);
+}
+
 static void llama_grammar_invalidate_candidate_cache(struct llama_grammar & grammar) {
     ++grammar.revision;
     grammar.candidate_accept_cache.clear();
@@ -1984,7 +1988,7 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         return;
     }
 
-    const bool allow_eog = llama_grammar_is_complete(grammar);
+    const bool allow_eog = llama_grammar_allows_eog(grammar);
 
     std::vector<std::pair<std::vector<uint32_t>, llama_partial_utf8>> candidates_decoded;
     candidates_decoded.reserve(cur_p->size);
@@ -2062,7 +2066,7 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
     }
 
     if (grammar.vocab->is_eog(token)) {
-        if (llama_grammar_is_complete(grammar)) {
+        if (llama_grammar_allows_eog(grammar)) {
             return;
         }
         GGML_ABORT("fatal error");

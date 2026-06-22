@@ -43,6 +43,10 @@ static bool grammar_is_complete(const llama_grammar * grammar) {
     return false;
 }
 
+static bool grammar_allows_eog(const llama_grammar * grammar) {
+    return grammar->partial_utf8.n_remain == 0 && grammar_is_complete(grammar);
+}
+
 static bool accept_token_piece(llama_grammar * grammar, llama_token token, const std::string & piece) {
     try {
         llama_grammar_accept_token(*grammar, token, piece);
@@ -174,6 +178,26 @@ static bool rule_is_caller(const llama_grammar_rule & rule, uint32_t done_rule) 
         is_end_of_sequence(&rule[3]);
 }
 
+static void test_nullable_utf8_eog_after_partial() {
+    llama_grammar * grammar = build_grammar(R"""(root ::= "\u00E9" | "")""");
+    assert(accept_token_piece(grammar, 100, std::string("\xC3", 1)));
+    assert(grammar->partial_utf8.n_remain > 0);
+    assert(!grammar_allows_eog(grammar));
+
+    llama_grammar * completes_e9 = llama_grammar_clone_impl(*grammar);
+    assert(accept_token_piece(completes_e9, 101, std::string("\xA9", 1)));
+    assert(grammar_allows_eog(completes_e9));
+
+    llama_grammar * completes_a0 = llama_grammar_clone_impl(*grammar);
+    assert(!accept_token_piece(completes_a0, 102, std::string("\xA0", 1)));
+    assert(!grammar_allows_eog(completes_a0));
+
+    std::fprintf(stdout, "nullable-utf8-eog partial=0 completed=1 wrong=0\n");
+    llama_grammar_free_impl(completes_a0);
+    llama_grammar_free_impl(completes_e9);
+    llama_grammar_free_impl(grammar);
+}
+
 static void test_completion_reallocation_stress() {
     constexpr size_t n_callers = 8191;
     std::string grammar_str = R"""(root ::= "q"
@@ -238,6 +262,7 @@ int main(int argc, char ** argv) {
     test_a_star_plateau(long_run ? 100000 : 1000);
     test_balanced_exact(long_run ? 512 : 64);
     test_token_not_empty_candidate();
+    test_nullable_utf8_eog_after_partial();
     test_completion_reallocation_stress();
 
     return 0;
