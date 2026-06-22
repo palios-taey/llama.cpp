@@ -7,6 +7,8 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 
 #define MAX_REPETITION_THRESHOLD 2000
@@ -893,6 +895,403 @@ static void llama_grammar_release_seen(llama_grammar_chart_column & column) {
     std::unordered_set<llama_grammar_item, llama_grammar_item_hash>().swap(column.seen);
 }
 
+static bool llama_grammar_is_complete_item(
+        const llama_grammar_rules & rules,
+        const llama_grammar_item  & item) {
+    return llama_grammar_is_end_of_sequence(&rules[item.rule][item.dot]);
+}
+
+static uint32_t llama_grammar_first_end_dot(
+        const llama_grammar_rules & rules,
+        uint32_t                    rule_id) {
+    const llama_grammar_rule & rule = rules[rule_id];
+    for (uint32_t dot = 0; dot < rule.size(); ++dot) {
+        if (llama_grammar_is_end_of_sequence(&rule[dot])) {
+            return dot;
+        }
+    }
+    GGML_ABORT("malformed grammar rule without end marker");
+}
+
+static bool llama_grammar_is_start_complete(
+        const llama_grammar_rules & rules,
+        size_t                      start_rule_index,
+        const llama_grammar_item  & item) {
+    return item.rule == start_rule_index &&
+        item.origin == 0 &&
+        llama_grammar_is_complete_item(rules, item);
+}
+
+static llama_grammar_item llama_grammar_start_complete_item(
+        const llama_grammar_rules & rules,
+        size_t                      start_rule_index) {
+    return {
+        static_cast<uint32_t>(start_rule_index),
+        llama_grammar_first_end_dot(rules, static_cast<uint32_t>(start_rule_index)),
+        0,
+    };
+}
+
+template <typename AddItem>
+static void llama_grammar_add_resume_items(
+        const llama_grammar_rules        & rules,
+        size_t                            start_rule_index,
+        const llama_grammar_resume_entry & entry,
+        AddItem &&                         add_item) {
+    for (const llama_grammar_item & item : entry.items) {
+        add_item(item);
+    }
+
+    if (entry.root_completed) {
+        add_item(llama_grammar_start_complete_item(rules, start_rule_index));
+    }
+}
+
+static void llama_grammar_rebuild_column_seen(llama_grammar_chart_column & column) {
+    std::vector<llama_grammar_item> items;
+    items.swap(column.items);
+    column.seen.clear();
+
+    for (const llama_grammar_item & item : items) {
+        llama_grammar_add_item(column, item);
+    }
+}
+
+static void llama_grammar_remap_column_items(
+        llama_grammar_chart_column & column,
+        uint32_t                     old_origin,
+        uint32_t                     new_origin) {
+    if (old_origin == new_origin || column.items.empty()) {
+        return;
+    }
+
+    for (llama_grammar_item & item : column.items) {
+        if (item.origin == old_origin) {
+            item.origin = new_origin;
+        }
+    }
+
+    llama_grammar_rebuild_column_seen(column);
+}
+
+static void llama_grammar_remap_resume_items(
+        llama_grammar_resume_entry & entry,
+        uint32_t                     old_origin,
+        uint32_t                     new_origin) {
+    if (old_origin == new_origin || entry.items.empty()) {
+        return;
+    }
+
+    std::vector<llama_grammar_item> items;
+    items.swap(entry.items);
+    for (llama_grammar_item item : items) {
+        if (item.origin == old_origin) {
+            item.origin = new_origin;
+        }
+        llama_grammar_add_item(entry.items, item);
+    }
+}
+
+static void llama_grammar_remap_chart_origin(
+        std::vector<llama_grammar_chart_column> & chart,
+        uint32_t                                  old_origin,
+        uint32_t                                  new_origin) {
+    if (old_origin == new_origin) {
+        return;
+    }
+
+    for (llama_grammar_chart_column & column : chart) {
+        llama_grammar_remap_column_items(column, old_origin, new_origin);
+        for (auto & resume : column.resume) {
+            llama_grammar_remap_resume_items(resume.second, old_origin, new_origin);
+        }
+    }
+}
+
+static std::string llama_grammar_origin_signature(
+        const std::vector<llama_grammar_chart_column> & chart,
+        size_t                                          origin) {
+    const llama_grammar_chart_column & column = chart[origin];
+    std::vector<uint32_t> rules;
+    rules.reserve(column.resume.size());
+    for (const auto & resume : column.resume) {
+        if (resume.second.root_completed || !resume.second.items.empty()) {
+            rules.push_back(resume.first);
+        }
+    }
+    std::sort(rules.begin(), rules.end());
+
+    std::ostringstream out;
+    for (uint32_t rule : rules) {
+        const llama_grammar_resume_entry & entry = column.resume.at(rule);
+        std::vector<std::string> items;
+        items.reserve(entry.items.size());
+
+        for (const llama_grammar_item & item : entry.items) {
+            std::ostringstream encoded;
+            encoded << item.rule << ':' << item.dot << ':';
+            if (item.origin == origin) {
+                encoded << "SELF";
+            } else {
+                encoded << item.origin;
+            }
+            items.push_back(encoded.str());
+        }
+
+        std::sort(items.begin(), items.end());
+        out << rule << '=' << (entry.root_completed ? '1' : '0') << '[';
+        for (const std::string & item : items) {
+            out << item << ';';
+        }
+        out << "];";
+    }
+
+    return out.str();
+}
+
+static void llama_grammar_normalize_resume_entry(
+        const llama_grammar_rules                           & rules,
+        size_t                                               start_rule_index,
+        const std::vector<llama_grammar_chart_column>       & chart,
+        size_t                                               sealing_origin,
+        const std::unordered_map<uint32_t, llama_grammar_resume_entry> & raw_resume,
+        llama_grammar_resume_entry                         & entry) {
+    std::vector<llama_grammar_item> work = entry.items;
+    std::vector<llama_grammar_item> normalized;
+    std::unordered_set<uint64_t> expanded_completions;
+    bool root_completed = entry.root_completed;
+
+    for (size_t i = 0; i < work.size(); ++i) {
+        const llama_grammar_item item = work[i];
+
+        if (!llama_grammar_is_complete_item(rules, item)) {
+            llama_grammar_add_item(normalized, item);
+            continue;
+        }
+
+        if (llama_grammar_is_start_complete(rules, start_rule_index, item)) {
+            root_completed = true;
+        }
+
+        const uint64_t completed_key =
+            (static_cast<uint64_t>(item.origin) << 32) | static_cast<uint64_t>(item.rule);
+        if (!expanded_completions.insert(completed_key).second) {
+            continue;
+        }
+
+        const llama_grammar_resume_entry * resume = nullptr;
+        if (item.origin == sealing_origin) {
+            const auto found = raw_resume.find(item.rule);
+            if (found != raw_resume.end()) {
+                resume = &found->second;
+            }
+        } else {
+            GGML_ASSERT(item.origin < chart.size());
+            const auto found = chart[item.origin].resume.find(item.rule);
+            if (found != chart[item.origin].resume.end()) {
+                resume = &found->second;
+            }
+        }
+
+        if (resume == nullptr) {
+            continue;
+        }
+
+        if (resume->root_completed) {
+            root_completed = true;
+        }
+        work.insert(work.end(), resume->items.begin(), resume->items.end());
+    }
+
+    entry.root_completed = root_completed;
+    entry.items = std::move(normalized);
+}
+
+static void llama_grammar_normalize_resume(
+        const llama_grammar_rules                     & rules,
+        size_t                                         start_rule_index,
+        const std::vector<llama_grammar_chart_column> & chart,
+        size_t                                         sealing_origin,
+        std::unordered_map<uint32_t, llama_grammar_resume_entry> & resume) {
+    std::vector<uint32_t> empty_rules;
+
+    for (auto & entry : resume) {
+        llama_grammar_normalize_resume_entry(
+                rules,
+                start_rule_index,
+                chart,
+                sealing_origin,
+                resume,
+                entry.second);
+
+        if (!entry.second.root_completed && entry.second.items.empty()) {
+            empty_rules.push_back(entry.first);
+        }
+    }
+
+    for (uint32_t rule : empty_rules) {
+        resume.erase(rule);
+    }
+}
+
+static size_t llama_grammar_seal_origin(
+        const llama_grammar_rules               & rules,
+        size_t                                    start_rule_index,
+              std::vector<llama_grammar_chart_column> & chart,
+              size_t                              origin) {
+    llama_grammar_chart_column & column = chart[origin];
+    if (column.sealed) {
+        return origin;
+    }
+
+    std::unordered_map<uint32_t, llama_grammar_resume_entry> resume;
+    for (const llama_grammar_item & caller : column.items) {
+        const llama_grammar_element * pos = &rules[caller.rule][caller.dot];
+        if (pos->type == LLAMA_GRETYPE_RULE_REF) {
+            llama_grammar_add_item(
+                    resume[pos->value].items,
+                    llama_grammar_advance_item(rules, caller, pos + 1));
+        }
+    }
+
+    llama_grammar_normalize_resume(rules, start_rule_index, chart, origin, resume);
+
+    column.resume = std::move(resume);
+    column.sealed = true;
+
+    const std::string signature = llama_grammar_origin_signature(chart, origin);
+    for (size_t candidate = 0; candidate < chart.size(); ++candidate) {
+        if (candidate == origin || !chart[candidate].sealed) {
+            continue;
+        }
+        if (llama_grammar_origin_signature(chart, candidate) == signature) {
+            std::vector<llama_grammar_item>().swap(column.items);
+            llama_grammar_release_seen(column);
+            column.resume.clear();
+            return candidate;
+        }
+    }
+
+    std::vector<llama_grammar_item>().swap(column.items);
+    llama_grammar_release_seen(column);
+    return origin;
+}
+
+static void llama_grammar_mark_origin(
+        const std::vector<llama_grammar_chart_column> & chart,
+        size_t                                          origin,
+        std::vector<bool>                             & marked) {
+    if (origin >= chart.size() || marked[origin]) {
+        return;
+    }
+
+    marked[origin] = true;
+    const llama_grammar_chart_column & column = chart[origin];
+
+    for (const llama_grammar_item & item : column.items) {
+        llama_grammar_mark_origin(chart, item.origin, marked);
+    }
+
+    for (const auto & resume : column.resume) {
+        if (resume.second.root_completed && !chart.empty()) {
+            llama_grammar_mark_origin(chart, 0, marked);
+        }
+        for (const llama_grammar_item & item : resume.second.items) {
+            llama_grammar_mark_origin(chart, item.origin, marked);
+        }
+    }
+}
+
+static void llama_grammar_remap_item(
+        llama_grammar_item          & item,
+        const std::vector<uint32_t> & remap) {
+    GGML_ASSERT(item.origin < remap.size());
+    GGML_ASSERT(remap[item.origin] != std::numeric_limits<uint32_t>::max());
+    item.origin = remap[item.origin];
+}
+
+static void llama_grammar_remap_column(
+        llama_grammar_chart_column  & column,
+        const std::vector<uint32_t> & remap) {
+    if (!column.items.empty()) {
+        for (llama_grammar_item & item : column.items) {
+            llama_grammar_remap_item(item, remap);
+        }
+        llama_grammar_rebuild_column_seen(column);
+    }
+
+    for (auto & resume : column.resume) {
+        std::vector<llama_grammar_item> items;
+        items.swap(resume.second.items);
+        for (llama_grammar_item item : items) {
+            llama_grammar_remap_item(item, remap);
+            llama_grammar_add_item(resume.second.items, item);
+        }
+    }
+}
+
+static void llama_grammar_compact_chart(std::vector<llama_grammar_chart_column> & chart) {
+    if (chart.empty()) {
+        return;
+    }
+
+    const size_t current = chart.size() - 1;
+    std::vector<bool> marked(chart.size(), false);
+    llama_grammar_mark_origin(chart, 0, marked);
+    llama_grammar_mark_origin(chart, current, marked);
+
+    const uint32_t invalid = std::numeric_limits<uint32_t>::max();
+    std::vector<uint32_t> remap(chart.size(), invalid);
+    std::vector<llama_grammar_chart_column> compacted;
+    compacted.reserve(chart.size());
+
+    auto append_origin = [&](size_t old_origin) {
+        remap[old_origin] = static_cast<uint32_t>(compacted.size());
+        compacted.push_back(std::move(chart[old_origin]));
+    };
+
+    if (marked[0]) {
+        append_origin(0);
+    }
+
+    for (size_t origin = 1; origin < chart.size(); ++origin) {
+        if (origin != current && marked[origin]) {
+            append_origin(origin);
+        }
+    }
+
+    if (current != 0 && marked[current]) {
+        append_origin(current);
+    }
+
+    for (llama_grammar_chart_column & column : compacted) {
+        llama_grammar_remap_column(column, remap);
+    }
+
+    chart.swap(compacted);
+}
+
+static void llama_grammar_seal_finished_origins(
+        const llama_grammar_rules               & rules,
+        size_t                                    start_rule_index,
+              std::vector<llama_grammar_chart_column> & chart) {
+    if (chart.empty()) {
+        return;
+    }
+
+    for (size_t origin = 0; origin + 1 < chart.size(); ++origin) {
+        if (chart[origin].sealed) {
+            continue;
+        }
+
+        const uint32_t canonical_origin =
+            static_cast<uint32_t>(llama_grammar_seal_origin(rules, start_rule_index, chart, origin));
+        llama_grammar_remap_chart_origin(chart, static_cast<uint32_t>(origin), canonical_origin);
+    }
+
+    llama_grammar_compact_chart(chart);
+}
+
 template <typename AddItem>
 static void llama_grammar_add_rule_alternates(
         const llama_grammar_rules & rules,
@@ -917,31 +1316,59 @@ static void llama_grammar_add_rule_alternates(
     }
 }
 
-template <typename AddItem, typename ItemsAt>
+template <typename AddItem>
+static void llama_grammar_complete_from_items(
+        const llama_grammar_rules              & rules,
+        const std::vector<llama_grammar_item>  & origin_items,
+        uint32_t                                completed_rule,
+        AddItem &&                              add_item) {
+    for (const llama_grammar_item & caller : origin_items) {
+        const llama_grammar_element * caller_pos = &rules[caller.rule][caller.dot];
+
+        if (caller_pos->type == LLAMA_GRETYPE_RULE_REF && caller_pos->value == completed_rule) {
+            add_item(llama_grammar_advance_item(rules, caller, caller_pos + 1));
+        }
+    }
+}
+
+template <typename AddItem>
+static void llama_grammar_complete_from_resume(
+        const llama_grammar_rules                     & rules,
+        size_t                                         start_rule_index,
+        const std::vector<llama_grammar_chart_column> & chart,
+        uint32_t                                       origin,
+        uint32_t                                       completed_rule,
+        AddItem &&                                     add_item) {
+    GGML_ASSERT(origin < chart.size());
+    const auto found = chart[origin].resume.find(completed_rule);
+    if (found == chart[origin].resume.end()) {
+        return;
+    }
+
+    llama_grammar_add_resume_items(
+            rules,
+            start_rule_index,
+            found->second,
+            [&](const llama_grammar_item & item) {
+                add_item(item);
+            });
+}
+
+template <typename AddItem, typename CompleteOrigin>
 static void llama_grammar_close_items(
         const llama_grammar_rules        & rules,
         const std::vector<bool>          & rules_may_be_empty,
               std::vector<llama_grammar_item> & current,
               size_t                       column,
               AddItem &&                   add_item,
-              ItemsAt &&                   items_at) {
+              CompleteOrigin &&            complete_origin) {
     for (size_t i = 0; i < current.size(); ++i) {
         const llama_grammar_item item = current[i];
         const llama_grammar_element * pos = &rules[item.rule][item.dot];
 
         if (llama_grammar_is_end_of_sequence(pos)) {
             GGML_ASSERT(item.origin <= column);
-            const std::vector<llama_grammar_item> & origin = items_at(item.origin);
-
-            for (size_t j = 0; j < origin.size(); ++j) {
-                const llama_grammar_item caller = origin[j];
-                const llama_grammar_element * caller_pos = &rules[caller.rule][caller.dot];
-
-                if (caller_pos->type == LLAMA_GRETYPE_RULE_REF && caller_pos->value == item.rule) {
-                    add_item(llama_grammar_advance_item(rules, caller, caller_pos + 1));
-                }
-            }
-
+            complete_origin(item.origin, item.rule, add_item);
             continue;
         }
 
@@ -970,6 +1397,7 @@ static void llama_grammar_close_items(
 
 static void llama_grammar_close_column(
         const llama_grammar_rules               & rules,
+        size_t                                    start_rule_index,
         const std::vector<bool>                 & rules_may_be_empty,
               std::vector<llama_grammar_chart_column> & chart,
               size_t                              column) {
@@ -981,17 +1409,29 @@ static void llama_grammar_close_column(
             [&](const llama_grammar_item & item) {
                 llama_grammar_add_item(chart[column], item);
             },
-            [&](size_t index) -> const std::vector<llama_grammar_item> & {
-                GGML_ASSERT(index < chart.size());
-                return chart[index].items;
+            [&](uint32_t origin, uint32_t completed_rule, const auto & add_completed_item) {
+                GGML_ASSERT(origin < chart.size());
+                if (origin == column || !chart[origin].sealed) {
+                    llama_grammar_complete_from_items(rules, chart[origin].items, completed_rule, add_completed_item);
+                } else {
+                    llama_grammar_complete_from_resume(
+                            rules,
+                            start_rule_index,
+                            chart,
+                            origin,
+                            completed_rule,
+                            add_completed_item);
+                }
             });
 }
 
 static void llama_grammar_scan_chr(
         const llama_grammar_rules               & rules,
+        size_t                                    start_rule_index,
         const std::vector<bool>                 & rules_may_be_empty,
               std::vector<llama_grammar_chart_column> & chart,
-              uint32_t                            chr) {
+              uint32_t                            chr,
+              bool                                compact_finished_origins = true) {
     const size_t source = chart.size() - 1;
     llama_grammar_release_seen(chart[source]);
     chart.emplace_back();
@@ -1010,19 +1450,23 @@ static void llama_grammar_scan_chr(
         }
     }
 
-    llama_grammar_close_column(rules, rules_may_be_empty, chart, target);
+    llama_grammar_close_column(rules, start_rule_index, rules_may_be_empty, chart, target);
+    if (compact_finished_origins) {
+        llama_grammar_seal_finished_origins(rules, start_rule_index, chart);
+    }
 }
 
 static void llama_grammar_scan_token_to_column(
         const llama_grammar_rules               & rules,
+        size_t                                    start_rule_index,
         const std::vector<bool>                 & rules_may_be_empty,
               std::vector<llama_grammar_chart_column> & chart,
-              size_t                              source,
+        const std::vector<llama_grammar_item>    & source_items,
               size_t                              target,
               llama_token                         token) {
-    const size_t n_items = chart[source].items.size();
+    const size_t n_items = source_items.size();
     for (size_t i = 0; i < n_items; ++i) {
-        const llama_grammar_item item = chart[source].items[i];
+        const llama_grammar_item item = source_items[i];
         const llama_grammar_element * pos = &rules[item.rule][item.dot];
 
         if (llama_grammar_is_token_element(pos) && llama_grammar_match_token(pos, token)) {
@@ -1030,21 +1474,24 @@ static void llama_grammar_scan_token_to_column(
         }
     }
 
-    llama_grammar_close_column(rules, rules_may_be_empty, chart, target);
+    llama_grammar_close_column(rules, start_rule_index, rules_may_be_empty, chart, target);
+    llama_grammar_seal_finished_origins(rules, start_rule_index, chart);
 }
 
 static void llama_grammar_scan_partial_token_to_new_column(
         const llama_grammar_rules               & rules,
+        size_t                                    start_rule_index,
         const std::vector<bool>                 & rules_may_be_empty,
               std::vector<llama_grammar_chart_column> & chart,
-              size_t                              source,
+        const std::vector<llama_grammar_item>    & source_items,
               llama_token                         token,
               llama_partial_utf8                  partial_utf8) {
+    const size_t source = chart.size() - 1;
     llama_grammar_release_seen(chart[source]);
     chart.emplace_back();
     const size_t target = chart.size() - 1;
 
-    for (const llama_grammar_item & item : chart[source].items) {
+    for (const llama_grammar_item & item : source_items) {
         const llama_grammar_element * pos = &rules[item.rule][item.dot];
 
         if (llama_grammar_is_char_element_start(pos) && llama_grammar_match_partial_char(pos, partial_utf8)) {
@@ -1054,7 +1501,8 @@ static void llama_grammar_scan_partial_token_to_new_column(
         }
     }
 
-    llama_grammar_close_column(rules, rules_may_be_empty, chart, target);
+    llama_grammar_close_column(rules, start_rule_index, rules_may_be_empty, chart, target);
+    llama_grammar_seal_finished_origins(rules, start_rule_index, chart);
 }
 
 static bool llama_grammar_has_partial_char_match(
@@ -1102,10 +1550,15 @@ struct llama_grammar_trial_chart {
         GGML_ASSERT(index - base.size() < n_added);
         return added[index - base.size()];
     }
+
+    bool has_mutable_items(size_t index) const {
+        return index >= base.size() || (index < base.size() && !base[index].sealed);
+    }
 };
 
 static void llama_grammar_close_trial_column(
         const llama_grammar_rules   & rules,
+        size_t                       start_rule_index,
         const std::vector<bool>     & rules_may_be_empty,
               llama_grammar_trial_chart & chart,
               size_t                 column) {
@@ -1118,13 +1571,24 @@ static void llama_grammar_close_trial_column(
             [&](const llama_grammar_item & item) {
                 llama_grammar_add_item(current, item);
             },
-            [&](size_t index) -> const std::vector<llama_grammar_item> & {
-                return chart.items(index);
+            [&](uint32_t origin, uint32_t completed_rule, const auto & add_completed_item) {
+                if (chart.has_mutable_items(origin)) {
+                    llama_grammar_complete_from_items(rules, chart.items(origin), completed_rule, add_completed_item);
+                } else {
+                    llama_grammar_complete_from_resume(
+                            rules,
+                            start_rule_index,
+                            chart.base,
+                            origin,
+                            completed_rule,
+                            add_completed_item);
+                }
             });
 }
 
 static size_t llama_grammar_trial_scan_chr(
         const llama_grammar_rules   & rules,
+        size_t                       start_rule_index,
         const std::vector<bool>     & rules_may_be_empty,
               llama_grammar_trial_chart & chart,
               size_t                 source,
@@ -1146,7 +1610,7 @@ static size_t llama_grammar_trial_scan_chr(
         }
     }
 
-    llama_grammar_close_trial_column(rules, rules_may_be_empty, chart, target);
+    llama_grammar_close_trial_column(rules, start_rule_index, rules_may_be_empty, chart, target);
     return target;
 }
 
@@ -1172,7 +1636,13 @@ static bool llama_grammar_accepts_candidate(
     chart.reset();
     size_t column = grammar.chart.size() - 1;
     for (const uint32_t * code_point = candidate.code_points; *code_point != 0; ++code_point) {
-        column = llama_grammar_trial_scan_chr(grammar.rules, grammar.rules_may_be_empty, chart, column, *code_point);
+        column = llama_grammar_trial_scan_chr(
+                grammar.rules,
+                grammar.start_rule_index,
+                grammar.rules_may_be_empty,
+                chart,
+                column,
+                *code_point);
     }
 
     if (candidate.partial_utf8.n_remain != 0) {
@@ -1290,7 +1760,12 @@ static void llama_grammar_invalidate_candidate_cache(struct llama_grammar & gram
 }
 
 void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr) {
-    llama_grammar_scan_chr(grammar->rules, grammar->rules_may_be_empty, grammar->chart, chr);
+    llama_grammar_scan_chr(
+            grammar->rules,
+            grammar->start_rule_index,
+            grammar->rules_may_be_empty,
+            grammar->chart,
+            chr);
     llama_grammar_invalidate_candidate_cache(*grammar);
 }
 
@@ -1307,7 +1782,7 @@ static std::vector<llama_grammar_chart_column> llama_grammar_init_chart(
             [&](const llama_grammar_item & item) {
                 llama_grammar_add_item(chart[0], item);
             });
-    llama_grammar_close_column(rules, rules_may_be_empty, chart, 0);
+    llama_grammar_close_column(rules, start_rule_index, rules_may_be_empty, chart, 0);
     return chart;
 }
 
@@ -1583,7 +2058,12 @@ void llama_grammar_accept_str(struct llama_grammar & grammar, const std::string 
     const auto & code_points = decoded.first;
 
     for (auto it = code_points.begin(), end = code_points.end() - 1; it != end; ++it) {
-        llama_grammar_scan_chr(grammar.rules, grammar.rules_may_be_empty, grammar.chart, *it);
+        llama_grammar_scan_chr(
+                grammar.rules,
+                grammar.start_rule_index,
+                grammar.rules_may_be_empty,
+                grammar.chart,
+                *it);
     }
 
     grammar.partial_utf8 = decoded.second;
@@ -1600,25 +2080,34 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
     const auto & code_points = decoded.first;
 
     const size_t source = grammar.chart.size() - 1;
+    const std::vector<llama_grammar_item> source_items = grammar.chart[source].items;
 
     for (auto it = code_points.begin(), end = code_points.end() - 1; it != end; ++it) {
-        llama_grammar_scan_chr(grammar.rules, grammar.rules_may_be_empty, grammar.chart, *it);
+        llama_grammar_scan_chr(
+                grammar.rules,
+                grammar.start_rule_index,
+                grammar.rules_may_be_empty,
+                grammar.chart,
+                *it,
+                false);
     }
 
     if (code_points.size() == 1 && decoded.second.n_remain != 0) {
         llama_grammar_scan_partial_token_to_new_column(
                 grammar.rules,
+                grammar.start_rule_index,
                 grammar.rules_may_be_empty,
                 grammar.chart,
-                source,
+                source_items,
                 token,
                 decoded.second);
     } else {
         llama_grammar_scan_token_to_column(
                 grammar.rules,
+                grammar.start_rule_index,
                 grammar.rules_may_be_empty,
                 grammar.chart,
-                source,
+                source_items,
                 grammar.chart.size() - 1,
                 token);
     }

@@ -88,9 +88,16 @@ struct llama_grammar_item_hash {
     }
 };
 
+struct llama_grammar_resume_entry {
+    bool root_completed = false;
+    std::vector<llama_grammar_item> items;
+};
+
 struct llama_grammar_chart_column {
     std::vector<llama_grammar_item> items;
     std::unordered_set<llama_grammar_item, llama_grammar_item_hash> seen;
+    std::unordered_map<uint32_t, llama_grammar_resume_entry> resume;
+    bool sealed = false;
 };
 
 // note: needed for tests (not great)
