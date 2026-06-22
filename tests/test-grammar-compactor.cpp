@@ -5,9 +5,14 @@
 #include "../src/llama-grammar.h"
 
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+bool llama_grammar_accepts_token_id_for_test(const llama_grammar * grammar, llama_token token);
 
 struct chart_stats {
     size_t origins = 0;
@@ -145,11 +150,95 @@ static void test_balanced_exact(size_t max_n) {
     llama_grammar_free_impl(grammar_state);
 }
 
+static void test_token_not_empty_candidate() {
+    llama_grammar * grammar = build_grammar(R"""(root ::= !<[42]>)""");
+
+    assert(!llama_grammar_accepts_token_id_for_test(grammar, 42));
+    assert(llama_grammar_accepts_token_id_for_test(grammar, 43));
+
+    std::fprintf(stdout, "token-not-empty-candidate excluded=0 allowed=1\n");
+    llama_grammar_free_impl(grammar);
+}
+
+static bool rule_is_done(const llama_grammar_rule & rule) {
+    return rule.size() == 2 &&
+        rule[0].type == LLAMA_GRETYPE_CHAR && rule[0].value == static_cast<uint32_t>('x') &&
+        is_end_of_sequence(&rule[1]);
+}
+
+static bool rule_is_caller(const llama_grammar_rule & rule, uint32_t done_rule) {
+    return rule.size() == 4 &&
+        rule[0].type == LLAMA_GRETYPE_CHAR && rule[0].value == static_cast<uint32_t>('x') &&
+        rule[1].type == LLAMA_GRETYPE_RULE_REF && rule[1].value == done_rule &&
+        rule[2].type == LLAMA_GRETYPE_CHAR && rule[2].value == static_cast<uint32_t>('y') &&
+        is_end_of_sequence(&rule[3]);
+}
+
+static void test_completion_reallocation_stress() {
+    constexpr size_t n_callers = 8191;
+    std::string grammar_str = R"""(root ::= "q"
+done ::= "x"
+)""";
+
+    for (size_t i = 0; i < n_callers; ++i) {
+        grammar_str += "caller" + std::to_string(i) + R"""( ::= "x" done "y"
+)""";
+    }
+
+    llama_grammar * grammar = build_grammar(grammar_str);
+
+    uint32_t done_rule = std::numeric_limits<uint32_t>::max();
+    for (uint32_t rule_id = 0; rule_id < grammar->rules.size(); ++rule_id) {
+        if (rule_is_done(grammar->rules[rule_id])) {
+            done_rule = rule_id;
+            break;
+        }
+    }
+    assert(done_rule != std::numeric_limits<uint32_t>::max());
+
+    std::vector<uint32_t> caller_rules;
+    std::vector<bool> is_caller(grammar->rules.size(), false);
+    for (uint32_t rule_id = 0; rule_id < grammar->rules.size(); ++rule_id) {
+        if (rule_is_caller(grammar->rules[rule_id], done_rule)) {
+            caller_rules.push_back(rule_id);
+            is_caller[rule_id] = true;
+        }
+    }
+    assert(caller_rules.size() == n_callers);
+
+    grammar->chart.clear();
+    grammar->chart.emplace_back();
+    grammar->chart.back().items.reserve(n_callers + 1);
+    grammar->chart.back().items.push_back({ done_rule, 0, 1 });
+    for (uint32_t caller_rule : caller_rules) {
+        grammar->chart.back().items.push_back({ caller_rule, 0, 1 });
+    }
+
+    llama_grammar_accept(grammar, static_cast<uint32_t>('x'));
+
+    size_t advanced_callers = 0;
+    for (const llama_grammar_item & item : grammar->chart.back().items) {
+        if (item.rule < is_caller.size() && is_caller[item.rule] && item.dot == 2 && item.origin == 1) {
+            ++advanced_callers;
+        }
+    }
+
+    assert(advanced_callers == n_callers);
+    std::fprintf(stdout, "completion-reallocation-stress callers=%zu advanced=%zu final_items=%zu\n",
+            n_callers,
+            advanced_callers,
+            grammar->chart.back().items.size());
+
+    llama_grammar_free_impl(grammar);
+}
+
 int main(int argc, char ** argv) {
     const bool long_run = argc > 1 && std::string(argv[1]) == "--long";
 
     test_a_star_plateau(long_run ? 100000 : 1000);
     test_balanced_exact(long_run ? 512 : 64);
+    test_token_not_empty_candidate();
+    test_completion_reallocation_stress();
 
     return 0;
 }

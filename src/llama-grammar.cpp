@@ -1322,7 +1322,9 @@ static void llama_grammar_complete_from_items(
         const std::vector<llama_grammar_item>  & origin_items,
         uint32_t                                completed_rule,
         AddItem &&                              add_item) {
-    for (const llama_grammar_item & caller : origin_items) {
+    const size_t n_items = origin_items.size();
+    for (size_t i = 0; i < n_items; ++i) {
+        const llama_grammar_item caller = origin_items[i];
         const llama_grammar_element * caller_pos = &rules[caller.rule][caller.dot];
 
         if (caller_pos->type == LLAMA_GRETYPE_RULE_REF && caller_pos->value == completed_rule) {
@@ -1381,9 +1383,11 @@ static void llama_grammar_close_items(
 
         if (rules_may_be_empty[rule_id]) {
             add_item(llama_grammar_advance_item(rules, item, pos + 1));
+            continue;
         }
 
-        for (size_t j = 0; j < current.size(); ++j) {
+        const size_t n_completed = current.size();
+        for (size_t j = 0; j < n_completed; ++j) {
             const llama_grammar_item completed = current[j];
 
             if (completed.rule == rule_id &&
@@ -1619,18 +1623,23 @@ static bool llama_grammar_accepts_candidate(
         const llama_grammar_candidate & candidate,
         llama_grammar_trial_chart     & chart) {
     bool accepts_token_terminal = false;
+    const bool has_code_points = *candidate.code_points != 0;
 
-    if (*candidate.code_points != 0 || candidate.partial_utf8.n_remain == 0) {
+    if (has_code_points || candidate.partial_utf8.n_remain == 0) {
         const auto & current = grammar.chart.back();
         for (const llama_grammar_item & item : current.items) {
             const llama_grammar_element * pos = &grammar.rules[item.rule][item.dot];
 
             if (llama_grammar_is_token_element(pos) &&
-                    (*candidate.code_points == 0 || llama_grammar_match_token(pos, candidate.id))) {
+                    llama_grammar_match_token(pos, candidate.id)) {
                 accepts_token_terminal = true;
                 break;
             }
         }
+    }
+
+    if (!has_code_points && candidate.partial_utf8.n_remain == 0) {
+        return accepts_token_terminal;
     }
 
     chart.reset();
@@ -1652,6 +1661,16 @@ static bool llama_grammar_accepts_candidate(
     }
 
     return accepts_token_terminal || !chart.items(column).empty();
+}
+
+bool llama_grammar_accepts_token_id_for_test(const llama_grammar * grammar, llama_token token);
+
+bool llama_grammar_accepts_token_id_for_test(const llama_grammar * grammar, llama_token token) {
+    uint32_t empty_code_points[] = { 0 };
+    llama_grammar_candidate candidate{ 0, empty_code_points, { 0, 0 }, token };
+    llama_grammar_trial_chart chart{ grammar->chart, {} };
+
+    return llama_grammar_accepts_candidate(*grammar, candidate, chart);
 }
 
 static llama_grammar_candidates llama_grammar_reject_candidates(
