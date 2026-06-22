@@ -5,6 +5,7 @@
 #include <map>
 #include <regex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 struct llama_vocab;
@@ -68,20 +69,36 @@ using llama_grammar_rules      = std::vector<llama_grammar_rule>;
 using llama_grammar_stacks     = std::vector<llama_grammar_stack>;
 using llama_grammar_candidates = std::vector<llama_grammar_candidate>;
 
+struct llama_grammar_item {
+    uint32_t rule   = 0;
+    uint32_t dot    = 0;
+    uint32_t origin = 0;
+
+    bool operator==(const llama_grammar_item & other) const {
+        return rule == other.rule && dot == other.dot && origin == other.origin;
+    }
+};
+
+struct llama_grammar_item_hash {
+    size_t operator()(const llama_grammar_item & item) const {
+        size_t h = item.rule;
+        h = h * 16777619u ^ item.dot;
+        h = h * 16777619u ^ item.origin;
+        return h;
+    }
+};
+
+struct llama_grammar_chart_column {
+    std::vector<llama_grammar_item> items;
+    std::unordered_set<llama_grammar_item, llama_grammar_item_hash> seen;
+};
+
 // TODO: remove, needed for tests atm
 const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar * grammar);
       llama_grammar_stacks & llama_grammar_get_stacks(      struct llama_grammar * grammar);
 
-// takes a set of possible pushdown stacks on a grammar, which are required to
-// be positioned at a character range (see `llama_grammar_advance_stack`), and
-// produces the N possible stacks if the given char is accepted at those
-// positions
+// Advance the grammar by one decoded Unicode code point.
 void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr);
-
-std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_stack(
-        const llama_grammar_rules      & rules,
-        const llama_grammar_stack      & stack,
-        const llama_grammar_candidates & candidates);
 
 struct llama_grammar_parser {
     const llama_vocab * vocab;
@@ -131,7 +148,14 @@ struct llama_grammar {
     const llama_vocab * vocab;
 
     const llama_grammar_rules  rules;  // TODO: shared ptr
-          llama_grammar_stacks stacks;
+    const size_t               start_rule_index;
+    const std::vector<bool>    rules_may_be_empty;
+
+    std::vector<llama_grammar_chart_column> chart;
+
+    // Opaque compatibility snapshot for tests and legacy callers that only need
+    // emptiness/completion/next-terminal visibility. The chart is authoritative.
+    llama_grammar_stacks stacks;
 
     // buffer for partially generated UTF-8 sequence from accepted tokens
     llama_partial_utf8 partial_utf8;

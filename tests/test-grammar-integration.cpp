@@ -118,11 +118,7 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
     fflush(stderr);
 
     auto * grammar = build_grammar(grammar_str);
-
-    // Save the original grammar stacks so that we can reset after every new string we want to test
-    const llama_grammar_stacks stacks_org = llama_grammar_get_stacks(grammar); // copy
-
-    llama_grammar_stacks & stacks_cur = llama_grammar_get_stacks(grammar);
+    assert(grammar != nullptr);
 
     fprintf(stderr, "  🔵 Valid strings:\n");
 
@@ -131,7 +127,9 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
         fprintf(stderr, "    \"%s\" ", test_string.c_str());
         fflush(stderr);
 
-        bool matched = match_string(test_string, grammar);
+        auto * case_grammar = llama_grammar_clone_impl(*grammar);
+
+        bool matched = match_string(test_string, case_grammar);
 
         if (!matched) {
             fprintf(stderr, "❌ (failed to match)\n");
@@ -157,9 +155,7 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
         }
 
         assert(matched);
-
-        // Reset the grammar stacks
-        stacks_cur = stacks_org;
+        llama_grammar_free_impl(case_grammar);
     }
 
     fprintf(stderr, "  🟠 Invalid strings:\n");
@@ -169,7 +165,9 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
         fprintf(stderr, "    \"%s\" ", test_string.c_str());
         fflush(stderr);
 
-        bool matched = match_string(test_string, grammar);
+        auto * case_grammar = llama_grammar_clone_impl(*grammar);
+
+        bool matched = match_string(test_string, case_grammar);
 
         if (matched) {
             fprintf(stderr, "❌ (incorrectly matched)\n");
@@ -177,12 +175,9 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
             fprintf(stdout, "✅︎\n");
         }
         assert(!matched);
-
-        // Reset the grammar stacks
-        stacks_cur = stacks_org;
+        llama_grammar_free_impl(case_grammar);
     }
 
-    // Clean up allocated memory
     llama_grammar_free_impl(grammar);
 }
 static void test_grammar(const std::string & test_desc, const std::string & grammar_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
