@@ -41,6 +41,25 @@ struct token_and_piece {
     std::string piece;
 };
 
+static bool is_end_of_sequence(const llama_grammar_element * pos) {
+    return pos->type == LLAMA_GRETYPE_END || pos->type == LLAMA_GRETYPE_ALT;
+}
+
+static bool grammar_has_items(const llama_grammar * grammar) {
+    return !grammar->chart.back().items.empty();
+}
+
+static bool grammar_is_complete(const llama_grammar * grammar) {
+    for (const llama_grammar_item & item : grammar->chart.back().items) {
+        if (item.rule == grammar->start_rule_index && item.origin == 0 &&
+                is_end_of_sequence(&grammar->rules[item.rule][item.dot])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // token() encodes a 32-bit ID as 5 bytes: a 0xff marker followed by the ID in big-endian order.
 static std::string token(llama_token id) {
     return std::string{
@@ -87,8 +106,6 @@ static std::vector<token_and_piece> parse_tokens(const std::string & input) {
 static bool match_string(const std::string & input, llama_grammar * grammar) {
     const auto parsed = parse_tokens(input);
 
-    auto & stacks_cur = llama_grammar_get_stacks(grammar);
-
     for (const auto & in : parsed) {
         try {
             llama_grammar_accept_token(*grammar, in.token, in.piece);
@@ -97,20 +114,13 @@ static bool match_string(const std::string & input, llama_grammar * grammar) {
             return false;
         }
 
-        if (stacks_cur.empty()) {
+        if (!grammar_has_items(grammar)) {
             // no stacks means that the grammar failed to match at this point
             return false;
         }
     }
 
-    for (const auto & stack : stacks_cur) {
-        if (stack.empty()) {
-            // An empty stack means that the grammar has been completed
-            return true;
-        }
-    }
-
-    return false;
+    return grammar_is_complete(grammar);
 }
 
 static void test(const std::string & test_desc, const std::string & grammar_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {

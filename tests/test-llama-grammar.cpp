@@ -12,21 +12,48 @@
 #include <utility>
 #include <vector>
 
+static bool is_end_of_sequence(const llama_grammar_element * pos) {
+    return pos->type == LLAMA_GRETYPE_END || pos->type == LLAMA_GRETYPE_ALT;
+}
+
+static bool grammar_has_items(const llama_grammar * grammar) {
+    return !grammar->chart.back().items.empty();
+}
+
+static bool grammar_is_complete(const llama_grammar * grammar) {
+    for (const llama_grammar_item & item : grammar->chart.back().items) {
+        if (item.rule == grammar->start_rule_index && item.origin == 0 &&
+                is_end_of_sequence(&grammar->rules[item.rule][item.dot])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool grammar_expects_char(const llama_grammar * grammar, uint32_t chr) {
+    for (const llama_grammar_item & item : grammar->chart.back().items) {
+        const llama_grammar_element * element = &grammar->rules[item.rule][item.dot];
+        if (element->type == LLAMA_GRETYPE_CHAR && element->value == chr) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool accepts(llama_grammar * grammar, const std::string & input) {
     llama_grammar * clone = llama_grammar_clone_impl(*grammar);
 
     for (unsigned char c : input) {
         llama_grammar_accept(clone, c);
-        if (llama_grammar_get_stacks(clone).empty()) {
+        if (!grammar_has_items(clone)) {
             llama_grammar_free_impl(clone);
             return false;
         }
     }
 
-    bool complete = false;
-    for (const auto & stack : llama_grammar_get_stacks(clone)) {
-        complete = complete || stack.empty();
-    }
+    const bool complete = grammar_is_complete(clone);
 
     llama_grammar_free_impl(clone);
     return complete;
@@ -140,23 +167,9 @@ int main() {
         throw std::runtime_error("Failed to initialize llama_grammar");
     }
 
-    bool expects_lparen = false;
-    bool expects_digit  = false;
-    bool expects_ident  = false;
-    for (const llama_grammar_stack & stack : llama_grammar_get_stacks(grammar)) {
-        assert(!stack.empty());
-        const llama_grammar_element * element = stack.back();
-        if (element->type == LLAMA_GRETYPE_CHAR && element->value == 40) {
-            expects_lparen = true;
-        } else if (element->type == LLAMA_GRETYPE_CHAR && element->value == 48) {
-            expects_digit = true;
-        } else if (element->type == LLAMA_GRETYPE_CHAR && element->value == 97) {
-            expects_ident = true;
-        }
-    }
-    assert(expects_lparen);
-    assert(expects_digit);
-    assert(expects_ident);
+    assert(grammar_expects_char(grammar, 40));
+    assert(grammar_expects_char(grammar, 48));
+    assert(grammar_expects_char(grammar, 97));
 
     assert(accepts(grammar, "a=1\n"));
     assert(accepts(grammar, "abc=42\n"));

@@ -67,7 +67,6 @@ using llama_grammar_rule  = std::vector<      llama_grammar_element>;
 using llama_grammar_stack = std::vector<const llama_grammar_element *>;
 
 using llama_grammar_rules      = std::vector<llama_grammar_rule>;
-using llama_grammar_stacks     = std::vector<llama_grammar_stack>;
 using llama_grammar_candidates = std::vector<llama_grammar_candidate>;
 
 struct llama_grammar_item {
@@ -94,9 +93,8 @@ struct llama_grammar_chart_column {
     std::unordered_set<llama_grammar_item, llama_grammar_item_hash> seen;
 };
 
-// TODO: remove, needed for tests atm
+// note: needed for tests (not great)
 const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar * grammar);
-      llama_grammar_stacks & llama_grammar_get_stacks(      struct llama_grammar * grammar);
 
 // Advance the grammar by one decoded Unicode code point.
 void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr);
@@ -153,10 +151,6 @@ struct llama_grammar {
     const std::vector<bool>    rules_may_be_empty;
 
     std::vector<llama_grammar_chart_column> chart;
-
-    // Opaque compatibility snapshot for tests and legacy callers that only need
-    // emptiness/completion/next-terminal visibility. The chart is authoritative.
-    llama_grammar_stacks stacks;
 
     uint64_t revision = 0;
     mutable uint64_t candidate_cache_revision = UINT64_MAX;

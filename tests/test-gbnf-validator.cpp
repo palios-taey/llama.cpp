@@ -8,16 +8,33 @@
 #include <string>
 #include <vector>
 
+static bool is_end_of_sequence(const llama_grammar_element * pos) {
+    return pos->type == LLAMA_GRETYPE_END || pos->type == LLAMA_GRETYPE_ALT;
+}
+
+static bool grammar_has_items(const llama_grammar * grammar) {
+    return !grammar->chart.back().items.empty();
+}
+
+static bool grammar_is_complete(const llama_grammar * grammar) {
+    for (const llama_grammar_item & item : grammar->chart.back().items) {
+        if (item.rule == grammar->start_rule_index && item.origin == 0 &&
+                is_end_of_sequence(&grammar->rules[item.rule][item.dot])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool llama_grammar_validate(struct llama_grammar * grammar, const std::string & input_str, size_t & error_pos, std::string & error_msg) {
     const auto cpts = unicode_cpts_from_utf8(input_str);
-
-    auto & stacks_cur = llama_grammar_get_stacks(grammar);
 
     size_t pos = 0;
     for (const auto & cpt : cpts) {
         llama_grammar_accept(grammar, cpt);
 
-        if (stacks_cur.empty()) {
+        if (!grammar_has_items(grammar)) {
             error_pos = pos;
             error_msg = "Unexpected character '" + unicode_cpt_to_utf8(cpt) + "'";
             return false;
@@ -25,10 +42,8 @@ static bool llama_grammar_validate(struct llama_grammar * grammar, const std::st
         ++pos;
     }
 
-    for (const auto & stack : stacks_cur) {
-        if (stack.empty()) {
-            return true;
-        }
+    if (grammar_is_complete(grammar)) {
+        return true;
     }
 
     error_pos = pos;

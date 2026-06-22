@@ -234,17 +234,38 @@ static std::string format_expected_element(const llama_grammar_rules & /* rules*
     }
 }
 
+static bool is_end_of_sequence(const llama_grammar_element * pos) {
+    return pos->type == LLAMA_GRETYPE_END || pos->type == LLAMA_GRETYPE_ALT;
+}
+
+static bool grammar_has_items(const llama_grammar * grammar) {
+    return !grammar->chart.back().items.empty();
+}
+
+static bool grammar_is_complete(const llama_grammar * grammar) {
+    for (const llama_grammar_item & item : grammar->chart.back().items) {
+        if (item.rule == grammar->start_rule_index && item.origin == 0 &&
+                is_end_of_sequence(&grammar->rules[item.rule][item.dot])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Get description of what the grammar expects at current position
-static std::string get_expected_description(const llama_grammar_rules & rules, const llama_grammar_stacks & stacks) {
-    if (stacks.empty()) {
+static std::string get_expected_description(const llama_grammar & grammar) {
+    if (grammar.chart.back().items.empty()) {
         return "<no valid continuations>";
     }
 
     std::string           result;
     std::set<std::string> seen;
 
-    for (const auto & stack : stacks) {
-        if (stack.empty()) {
+    for (const llama_grammar_item & item : grammar.chart.back().items) {
+        const llama_grammar_element * elem = &grammar.rules[item.rule][item.dot];
+
+        if (item.rule == grammar.start_rule_index && item.origin == 0 && is_end_of_sequence(elem)) {
             if (seen.insert("<end>").second) {
                 if (!result.empty()) {
                     result += " OR ";
@@ -254,8 +275,13 @@ static std::string get_expected_description(const llama_grammar_rules & rules, c
             continue;
         }
 
-        const llama_grammar_element * elem = stack.back();
-        std::string                   desc = format_expected_element(rules, elem);
+        if (elem->type != LLAMA_GRETYPE_CHAR && elem->type != LLAMA_GRETYPE_CHAR_NOT &&
+                elem->type != LLAMA_GRETYPE_CHAR_ANY && elem->type != LLAMA_GRETYPE_TOKEN &&
+                elem->type != LLAMA_GRETYPE_TOKEN_NOT) {
+            continue;
+        }
+
+        std::string                   desc = format_expected_element(grammar.rules, elem);
         if (seen.insert(desc).second) {
             if (!result.empty()) {
                 result += " OR ";
@@ -264,7 +290,7 @@ static std::string get_expected_description(const llama_grammar_rules & rules, c
         }
     }
 
-    return result;
+    return result.empty() ? "<no valid continuations>" : result;
 }
 
 // Result of a detailed grammar match attempt
@@ -288,16 +314,13 @@ static grammar_match_result match_string_detailed(const std::string & input, lla
     const auto cpts         = unicode_cpts_from_utf8(input);
     result.total_codepoints = cpts.size();
 
-    auto &       stacks_cur = llama_grammar_get_stacks(grammar);
-    const auto & rules      = llama_grammar_get_rules(grammar);
-
     size_t byte_pos = 0;
 
     for (size_t i = 0; i < cpts.size(); i++) {
         const auto & cpt = cpts[i];
 
         // Get expected before accepting (for error reporting)
-        std::string expected_before = get_expected_description(rules, stacks_cur);
+        std::string expected_before = get_expected_description(*grammar);
 
         llama_grammar_accept(grammar, cpt);
 
@@ -313,7 +336,7 @@ static grammar_match_result match_string_detailed(const std::string & input, lla
             cpt_bytes = 4;
         }
 
-        if (stacks_cur.empty()) {
+        if (!grammar_has_items(grammar)) {
             // Grammar failed to match at this point
             result.matched_bytes        = byte_pos;
             result.matched_codepoints   = i;
@@ -332,7 +355,7 @@ static grammar_match_result match_string_detailed(const std::string & input, lla
     result.matched_codepoints = cpts.size();
     result.matched_prefix     = input;
 
-    if (std::any_of(stacks_cur.begin(), stacks_cur.end(), [](const auto & stack) { return stack.empty(); })) {
+    if (grammar_is_complete(grammar)) {
         // An empty stack means that the grammar has been completed
         result.success    = true;
         result.incomplete = false;
@@ -340,7 +363,7 @@ static grammar_match_result match_string_detailed(const std::string & input, lla
         // Grammar expects more input
         result.success              = false;
         result.incomplete           = true;
-        result.expected_description = get_expected_description(rules, stacks_cur);
+        result.expected_description = get_expected_description(*grammar);
     }
 
     return result;
@@ -350,18 +373,16 @@ static grammar_match_result match_string_detailed(const std::string & input, lla
 static bool match_string(const std::string & input, llama_grammar * grammar) {
     const auto cpts = unicode_cpts_from_utf8(input);
 
-    auto & stacks_cur = llama_grammar_get_stacks(grammar);
-
     for (const auto & cpt : cpts) {
         llama_grammar_accept(grammar, cpt);
 
-        if (stacks_cur.empty()) {
+        if (!grammar_has_items(grammar)) {
             // no stacks means that the grammar failed to match at this point
             return false;
         }
     }
 
-    if (std::any_of(stacks_cur.begin(), stacks_cur.end(), [](const auto & stack) { return stack.empty(); })) {
+    if (grammar_is_complete(grammar)) {
         // An empty stack means that the grammar has been completed
         return true;
     }
