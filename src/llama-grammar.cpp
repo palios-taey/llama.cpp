@@ -1033,6 +1033,30 @@ static void llama_grammar_scan_token_to_column(
     llama_grammar_close_column(rules, rules_may_be_empty, chart, target);
 }
 
+static void llama_grammar_scan_partial_token_to_new_column(
+        const llama_grammar_rules               & rules,
+        const std::vector<bool>                 & rules_may_be_empty,
+              std::vector<llama_grammar_chart_column> & chart,
+              size_t                              source,
+              llama_token                         token,
+              llama_partial_utf8                  partial_utf8) {
+    llama_grammar_release_seen(chart[source]);
+    chart.emplace_back();
+    const size_t target = chart.size() - 1;
+
+    for (const llama_grammar_item & item : chart[source].items) {
+        const llama_grammar_element * pos = &rules[item.rule][item.dot];
+
+        if (llama_grammar_is_char_element_start(pos) && llama_grammar_match_partial_char(pos, partial_utf8)) {
+            llama_grammar_add_item(chart[target], item);
+        } else if (llama_grammar_is_token_element(pos) && llama_grammar_match_token(pos, token)) {
+            llama_grammar_add_item(chart[target], llama_grammar_advance_item(rules, item, pos + 1));
+        }
+    }
+
+    llama_grammar_close_column(rules, rules_may_be_empty, chart, target);
+}
+
 static bool llama_grammar_has_partial_char_match(
         const llama_grammar_rules        & rules,
         const std::vector<llama_grammar_item> & items,
@@ -1581,13 +1605,23 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
         llama_grammar_scan_chr(grammar.rules, grammar.rules_may_be_empty, grammar.chart, *it);
     }
 
-    llama_grammar_scan_token_to_column(
-            grammar.rules,
-            grammar.rules_may_be_empty,
-            grammar.chart,
-            source,
-            grammar.chart.size() - 1,
-            token);
+    if (code_points.size() == 1 && decoded.second.n_remain != 0) {
+        llama_grammar_scan_partial_token_to_new_column(
+                grammar.rules,
+                grammar.rules_may_be_empty,
+                grammar.chart,
+                source,
+                token,
+                decoded.second);
+    } else {
+        llama_grammar_scan_token_to_column(
+                grammar.rules,
+                grammar.rules_may_be_empty,
+                grammar.chart,
+                source,
+                grammar.chart.size() - 1,
+                token);
+    }
 
     grammar.partial_utf8 = decoded.second;
     llama_grammar_invalidate_candidate_cache(grammar);

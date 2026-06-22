@@ -123,6 +123,26 @@ static bool match_string(const std::string & input, llama_grammar * grammar) {
     return grammar_is_complete(grammar);
 }
 
+static bool accept_token_piece(llama_grammar * grammar, llama_token token, const std::string & piece) {
+    try {
+        llama_grammar_accept_token(*grammar, token, piece);
+    } catch (const std::runtime_error & /*e*/) {
+        return false;
+    }
+
+    return grammar_has_items(grammar);
+}
+
+static bool accepts_token_piece(const llama_grammar * grammar, llama_token token, const std::string & piece, bool * complete = nullptr) {
+    llama_grammar * clone = llama_grammar_clone_impl(*grammar);
+    const bool accepted = accept_token_piece(clone, token, piece);
+    if (complete != nullptr) {
+        *complete = accepted && grammar_is_complete(clone);
+    }
+    llama_grammar_free_impl(clone);
+    return accepted;
+}
+
 static void test(const std::string & test_desc, const std::string & grammar_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
     fprintf(stderr, "⚫ Testing %s\n%s\n", test_desc.c_str(), grammar_str.c_str());
     fflush(stderr);
@@ -195,6 +215,41 @@ static void test_grammar(const std::string & test_desc, const std::string & gram
 }
 static void test_schema(const std::string & test_desc, const std::string & schema_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
     test(test_desc + ". Schema: " + schema_str, json_schema_to_grammar(json::parse(schema_str), true), passing_strings, failing_strings);
+}
+
+static void test_multibyte_token_frontier_case(const std::string & test_desc, const std::string & grammar_str) {
+    fprintf(stderr, "⚫ Testing %s\n%s\n", test_desc.c_str(), grammar_str.c_str());
+    fflush(stderr);
+
+    const std::string byte_c3("\xC3", 1);
+    const std::string byte_a8("\xA8", 1);
+    const std::string byte_a9("\xA9", 1);
+
+    llama_grammar * grammar = build_grammar(grammar_str);
+    assert(grammar != nullptr);
+
+    assert(accepts_token_piece(grammar, 100, byte_c3));
+    assert(accept_token_piece(grammar, 100, byte_c3));
+
+    bool complete = false;
+    assert(accepts_token_piece(grammar, 102, byte_a9, &complete));
+    assert(complete);
+
+    complete = true;
+    assert(!accepts_token_piece(grammar, 101, byte_a8, &complete));
+    assert(!complete);
+
+    llama_grammar_free_impl(grammar);
+}
+
+static void test_multibyte_token_frontier() {
+    test_multibyte_token_frontier_case(
+        "multibyte byte-fallback TOKEN does not keep stale token frontier",
+        R"""(root ::= "\u00E9" | <[101]>)""");
+
+    test_multibyte_token_frontier_case(
+        "multibyte byte-fallback TOKEN_NOT does not keep stale token frontier",
+        R"""(root ::= "\u00E9" | !<[100]>)""");
 }
 
 static void test_simple_grammar() {
@@ -1492,6 +1547,7 @@ int main() {
     test_failure_left_recursion();
     test_failure_missing_root_symbol();
     test_custom_root_symbol_check();
+    test_multibyte_token_frontier();
     test_json_schema();
     fprintf(stdout, "All tests passed.\n");
     return 0;
