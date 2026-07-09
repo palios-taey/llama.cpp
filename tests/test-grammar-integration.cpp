@@ -84,17 +84,30 @@ static std::vector<token_and_piece> parse_tokens(const std::string & input) {
     return result;
 }
 
+static bool candidate_accepts_piece(llama_grammar * grammar, llama_token token, const std::string & piece);
+
 static bool match_string(const std::string & input, llama_grammar * grammar) {
     const auto parsed = parse_tokens(input);
 
     auto & stacks_cur = llama_grammar_get_stacks(grammar);
 
     for (const auto & in : parsed) {
+        const llama_grammar_stacks stacks_before = stacks_cur;
+        const llama_partial_utf8 partial_before = grammar->partial_utf8;
+
         try {
             llama_grammar_accept_token(*grammar, in.token, in.piece);
         } catch (const std::runtime_error & /*e*/) {
             // normally this shouldn't get hit because of llama_grammar_apply
             return false;
+        }
+
+        if (stacks_cur == stacks_before &&
+                grammar->partial_utf8.n_remain == partial_before.n_remain &&
+                grammar->partial_utf8.value == partial_before.value) {
+            if (!candidate_accepts_piece(grammar, in.token, in.piece)) {
+                return false;
+            }
         }
 
         if (stacks_cur.empty()) {
@@ -111,6 +124,35 @@ static bool match_string(const std::string & input, llama_grammar * grammar) {
     }
 
     return false;
+}
+
+static bool candidate_accepts_piece(llama_grammar * grammar, llama_token token, const std::string & piece) {
+    std::vector<uint32_t> code_points;
+    size_t offset = 0;
+    while (offset < piece.size()) {
+        try {
+            code_points.push_back(unicode_cpt_from_utf8(piece, offset));
+        } catch (const std::invalid_argument & /*ex*/) {
+            ++offset;
+            code_points.push_back(0xFFFD);
+        }
+    }
+    code_points.push_back(0);
+
+    llama_grammar_candidates candidates = {
+        {
+            /* .index        = */ 0,
+            /* .code_points  = */ code_points.data(),
+            /* .partial_utf8 = */ grammar->partial_utf8,
+            /* .id           = */ token,
+        },
+    };
+
+    for (const auto & stack : llama_grammar_get_stacks(grammar)) {
+        candidates = llama_grammar_reject_candidates_for_stack(llama_grammar_get_rules(grammar), stack, candidates);
+    }
+
+    return candidates.empty();
 }
 
 static void test(const std::string & test_desc, const std::string & grammar_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
